@@ -4,6 +4,8 @@ import curses
 import glob as glob_mod
 import os
 import textwrap
+import threading
+import time
 
 COMMANDS = {
     "/plan": "Toggle planning/direct mode",
@@ -29,6 +31,21 @@ C_STATUS = 8
 C_USER = 9
 C_THINKING = 10
 
+# Rainbow gradient (256-color palette indices)
+_RAINBOW_256 = [
+    196, 202, 208, 214, 220, 226,       # red -> yellow
+    190, 154, 118, 82, 46,              # yellow -> green
+    47, 48, 49, 50, 51,                 # green -> cyan
+    45, 39, 33, 27, 21,                 # cyan -> blue
+    57, 93, 129, 165, 201,              # blue -> magenta
+    200, 199, 198, 197,                 # magenta -> red
+]
+# Fallback for 8-color terminals
+_RAINBOW_8 = [1, 3, 2, 6, 4, 5]        # red, yellow, green, cyan, blue, magenta
+
+_RAINBOW_PAIR_BG = 20   # pairs for bar background (black fg)
+_RAINBOW_PAIR_FG = 52   # pairs for label text (white fg)
+
 
 class CursesUI:
     """Full-screen curses UI with setup wizard and REPL."""
@@ -51,6 +68,12 @@ class CursesUI:
         # Setup screen state
         self._setup_row = 0
 
+        # Working indicator state
+        self._working = False
+        self._work_tick = 0
+        self._anim_thread: threading.Thread | None = None
+        self._lock = threading.RLock()
+
         # Curses setup
         curses.curs_set(1)
         curses.use_default_colors()
@@ -67,6 +90,15 @@ class CursesUI:
         curses.init_pair(C_STATUS, curses.COLOR_BLACK, curses.COLOR_CYAN)
         curses.init_pair(C_USER, curses.COLOR_WHITE, -1)
         curses.init_pair(C_THINKING, curses.COLOR_BLACK, -1)
+
+        # Rainbow color pairs
+        if curses.COLORS >= 256:
+            self._rainbow = _RAINBOW_256
+        else:
+            self._rainbow = _RAINBOW_8
+        for i, color in enumerate(self._rainbow):
+            curses.init_pair(_RAINBOW_PAIR_BG + i, curses.COLOR_BLACK, color)
+            curses.init_pair(_RAINBOW_PAIR_FG + i, curses.COLOR_WHITE, color)
 
     # ================================================================
     #  Geometry helpers
@@ -383,11 +415,92 @@ class CursesUI:
             except curses.error:
                 pass
 
+    # ================================================================
+    #  Rainbow working indicator
+    # ================================================================
+
+    def _draw_rainbow_bar(self):
+        """Draw the animated rainbow bar on the bottom row."""
+        row = self.h - 1
+        w = self.w
+        n = len(self._rainbow)
+        stripe = 2  # chars per color stripe
+
+        # Fill bar with cycling rainbow background
+        for x in range(w - 1):
+            idx = ((x // stripe) + self._work_tick) % n
+            try:
+                self.stdscr.addch(row, x, ord(" "),
+                                  curses.color_pair(_RAINBOW_PAIR_BG + idx))
+            except curses.error:
+                pass
+
+        # Overlay centred label with white-on-rainbow
+        label = " working... "
+        lx = (w - len(label)) // 2
+        if lx >= 0:
+            for i, ch in enumerate(label):
+                x = lx + i
+                if x >= w - 1:
+                    break
+                idx = ((x // stripe) + self._work_tick) % n
+                try:
+                    self.stdscr.addch(row, x, ord(ch),
+                                      curses.color_pair(_RAINBOW_PAIR_FG + idx)
+                                      | curses.A_BOLD)
+                except curses.error:
+                    pass
+
+    def _animate_loop(self):
+        """Background thread: advance the rainbow ~14 FPS while working."""
+        while self._working:
+            if self._lock.acquire(blocking=False):
+                try:
+                    self._work_tick += 1
+                    self._draw_rainbow_bar()
+                    self.stdscr.refresh()
+                except curses.error:
+                    pass
+                finally:
+                    self._lock.release()
+            time.sleep(0.07)
+
+    def start_working(self):
+        """Show the animated rainbow bar."""
+        if self._working:
+            return
+        self._working = True
+        self._work_tick = 0
+        curses.curs_set(0)  # hide cursor during work
+        self._anim_thread = threading.Thread(target=self._animate_loop,
+                                             daemon=True)
+        self._anim_thread.start()
+
+    def stop_working(self):
+        """Hide the rainbow bar and restore the input line."""
+        if not self._working:
+            return
+        self._working = False
+        if self._anim_thread:
+            self._anim_thread.join(timeout=1)
+            self._anim_thread = None
+        curses.curs_set(1)
+        with self._lock:
+            try:
+                self.stdscr.move(self.h - 1, 0)
+                self.stdscr.clrtoeol()
+                self.stdscr.refresh()
+            except curses.error:
+                pass
+
     def refresh(self):
-        self.draw_header()
-        self.draw_content()
-        self.draw_status()
-        self.stdscr.refresh()
+        with self._lock:
+            self.draw_header()
+            self.draw_content()
+            self.draw_status()
+            if self._working:
+                self._draw_rainbow_bar()
+            self.stdscr.refresh()
 
     # ================================================================
     #  Content management

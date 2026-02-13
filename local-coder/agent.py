@@ -40,7 +40,8 @@ class Agent:
         for _ in range(self.max_tool_rounds):
             messages = [self._system_message(user_input)] + self.history
 
-            # Stream LLM response
+            # Stream LLM response (rainbow bar animates)
+            self.ui.start_working()
             self.ui.stream_start()
             tool_calls = []
             full_text = ""
@@ -53,13 +54,16 @@ class Agent:
                     elif chunk_type == "tool_call":
                         tool_calls.append(data)
             except KeyboardInterrupt:
+                self.ui.stop_working()
                 self.ui.stream_end()
                 raise
             except Exception as e:
+                self.ui.stop_working()
                 self.ui.stream_end()
                 self.ui.show_error(f"LLM error: {e}")
                 return
 
+            self.ui.stop_working()
             self.ui.stream_end()
 
             # Strip thinking blocks from stored text
@@ -108,6 +112,8 @@ class Agent:
     def _execute_tool_call(self, name: str, arguments: dict) -> str | None:
         """Execute a tool, handling agent-level tools and approvals."""
 
+        # --- tools that need user interaction (no rainbow) ---
+
         if name == "ask_user":
             answer = self.ui.get_question_response(arguments.get("question", ""))
             return f"User answered: {answer}"
@@ -149,10 +155,16 @@ class Agent:
             self.ui.show_info(f"Task complete: {summary}")
             return "Task summary saved to memory."
 
-        # Approval gate for write/edit/run
+        # --- tools that may need approval (pause rainbow for input) ---
+
         if name in APPROVAL_REQUIRED:
             desc = f"{name}({', '.join(f'{k}={repr(v)[:80]}' for k, v in arguments.items())})"
             if not self.ui.get_approval(desc):
                 return None
 
-        return execute_tool(name, arguments)
+        # --- execute with rainbow bar ---
+
+        self.ui.start_working()
+        result = execute_tool(name, arguments)
+        self.ui.stop_working()
+        return result
